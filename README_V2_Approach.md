@@ -92,20 +92,3 @@ So we need two script rows for Step 2: e.g. `ScriptKind = 'QueuePopulation'` and
 | 5 | Validation of config values | **DBA trust for now.** No validation proc; config values are trusted when doing REPLACE. |
 | 6 | Order of tables | **One table to completion (Steps 1→2→3) then next.** Master proc accepts a single `@TableName` and runs that table to completion; caller loops over table names for "all" tables. |
 
----
-
-## 4. Proposed V2 folder layout
-
-```
-V2/
-  README_V2_Approach.md          <- This file (approach, variables, questions)
-  00_Schema_V2.sql               <- State, queue, BlobMigrationTableConfig, BlobMigrationStepScript
-  01_Seed_DefaultScripts.sql     <- Default table config + step scripts (ReferralAttachment, ClientAttachment)
-  02_usp_BlobMigration_Run_V2.sql <- Master proc (implement after answers to questions)
-```
-
-- **Schema**: Progress PK `(RunId, TableName, Step, BatchNumber)`; queue; BlobMigrationTableConfig; BlobMigrationStepScript (with StageName); BlobMigrationQueuePopulationScript (one row per table for Step 2 queue).
-- **Seed**: Table config (ReferralAttachment, ClientAttachment), step scripts (StageName Roots/MissingParents/Children), queue population scripts per table.
-- **Proc**: Single entry point; reads config and script table, replaces placeholders, runs steps with batch-level resume and multi-table support as in the resumable proc.
-
-Schema and seed scripts are finalised; the master proc can be implemented in `02_usp_BlobMigration_Run_V2.sql` to use the script table and config.
