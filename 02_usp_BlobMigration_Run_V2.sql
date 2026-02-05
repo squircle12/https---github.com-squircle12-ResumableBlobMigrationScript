@@ -176,11 +176,12 @@ BEGIN
                 FROM dbo.BlobMigrationQueuePopulationScript
                 WHERE TableName = @TableName;
 
-                SET @Sql = REPLACE(REPLACE(REPLACE(REPLACE(@Sql,
+                SET @Sql = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@Sql,
                     N'[SourceTableFull]',    @SourceTableFull),
                     N'[TargetTableFull]',   @TargetTableFull),
                     N'[MetadataTableFull]', @MetadataTableFull),
-                    N'[MetadataIdColumn]',  @MetadataIdColumn);
+                    N'[MetadataIdColumn]',  @MetadataIdColumn),
+                    N'[MaxDOP]',            CAST(@MaxDOP AS NVARCHAR(10)));
 
                 EXEC sp_executesql @Sql,
                     N'@RunId UNIQUEIDENTIFIER, @TableName NVARCHAR(259), @ExcludedStreamId UNIQUEIDENTIFIER',
@@ -211,9 +212,12 @@ BEGIN
                 FROM dbo.BlobMigrationStepScript
                 WHERE StepNumber = 2 AND ScriptKind = N'BatchInsert';
 
-                SET @Sql = REPLACE(REPLACE(@Sql,
-                    N'[SourceTableFull]',  @SourceTableFull),
-                    N'[TargetTableFull]',  @TargetTableFull);
+                SET @Sql = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@Sql,
+                    N'[SourceTableFull]',    @SourceTableFull),
+                    N'[TargetTableFull]',   @TargetTableFull),
+                    N'[MetadataTableFull]', @MetadataTableFull),
+                    N'[MetadataIdColumn]',  @MetadataIdColumn),
+                    N'[MaxDOP]',            CAST(@MaxDOP AS NVARCHAR(10)));
 
                 EXEC sp_executesql @Sql;
 

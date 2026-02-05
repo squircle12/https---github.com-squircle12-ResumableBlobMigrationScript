@@ -110,7 +110,7 @@ SELECT RAFT.[stream_id], RAFT.[file_stream], RAFT.[name], RAFT.[path_locator],
 FROM [SourceTableFull] RAFT WITH (NOLOCK)
 INNER JOIN #Batch B ON B.stream_id = RAFT.stream_id
 OPTION (MAXDOP [MaxDOP]);
-', 0, N'Step 2: insert batch from queue (#Batch)')
+', 1, N'Step 2: insert batch from queue (#Batch)')
 WHEN MATCHED THEN
     UPDATE SET StageName = s.StageName, ScriptBody = N'
 INSERT INTO [TargetTableFull]
