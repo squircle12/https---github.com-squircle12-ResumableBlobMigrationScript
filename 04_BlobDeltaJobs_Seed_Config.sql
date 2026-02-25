@@ -180,7 +180,7 @@ WHERE RAFT.parent_path_locator IS NULL
   AND RAFT.stream_id <> @ExcludedStreamId
   AND RAM.[MetadataModifiedOnColumn] >  @WindowStart
   AND RAM.[MetadataModifiedOnColumn] <= @WindowEnd
-  AND (@BusinessUnitId IS NULL OR BU.businessunit = @BusinessUnitId)
+  AND (CASE WHEN @BusinessUnitId IS NULL THEN 1 WHEN BU.businessunit = @BusinessUnitId THEN 1 ELSE 0 END = 1)
 ORDER BY RAFT.stream_id
 OPTION (MAXDOP [MaxDOP]);
 ',
@@ -223,7 +223,7 @@ WHERE RAFT.parent_path_locator IS NULL
   AND RAFT.stream_id <> @ExcludedStreamId
   AND RAM.[MetadataModifiedOnColumn] >  @WindowStart
   AND RAM.[MetadataModifiedOnColumn] <= @WindowEnd
-  AND (@BusinessUnitId IS NULL OR BU.businessunit = @BusinessUnitId)
+  AND (CASE WHEN @BusinessUnitId IS NULL THEN 1 WHEN BU.businessunit = @BusinessUnitId THEN 1 ELSE 0 END = 1)
 ORDER BY RAFT.stream_id
 OPTION (MAXDOP [MaxDOP]);
 ',
@@ -358,7 +358,7 @@ WHERE RAFT.parent_path_locator IS NOT NULL
   AND RAFT.stream_id <> @ExcludedStreamId
   AND RAM.[MetadataModifiedOnColumn] >  @WindowStart
   AND RAM.[MetadataModifiedOnColumn] <= @WindowEnd
-  AND (@BusinessUnitId IS NULL OR BU.businessunit = @BusinessUnitId)
+  AND (CASE WHEN @BusinessUnitId IS NULL THEN 1 WHEN BU.businessunit = @BusinessUnitId THEN 1 ELSE 0 END = 1)
 ORDER BY RAFT.stream_id
 OPTION (MAXDOP 1);
 ',
@@ -401,7 +401,7 @@ WHERE RAFT.parent_path_locator IS NOT NULL
   AND RAFT.stream_id <> @ExcludedStreamId
   AND RAM.[MetadataModifiedOnColumn] >  @WindowStart
   AND RAM.[MetadataModifiedOnColumn] <= @WindowEnd
-  AND (@BusinessUnitId IS NULL OR BU.businessunit = @BusinessUnitId)
+  AND (CASE WHEN @BusinessUnitId IS NULL THEN 1 WHEN BU.businessunit = @BusinessUnitId THEN 1 ELSE 0 END = 1)
 ORDER BY RAFT.stream_id
 OPTION (MAXDOP 1);
 ',
@@ -419,7 +419,7 @@ SELECT
     @RunId,
     @TableName,
     Par.stream_id,
-    BU.businessunit,
+    Par.businessunit,
     0,
     SYSDATETIME()
 FROM (
@@ -435,7 +435,7 @@ FROM (
       AND RAFT.stream_id <> @ExcludedStreamId
       AND RAM.[MetadataModifiedOnColumn] >  @WindowStart
       AND RAM.[MetadataModifiedOnColumn] <= @WindowEnd
-      AND (@BusinessUnitId IS NULL OR BU.businessunit = @BusinessUnitId)
+      AND (CASE WHEN @BusinessUnitId IS NULL THEN 1 WHEN BU.businessunit = @BusinessUnitId THEN 1 ELSE 0 END = 1)
 ) Par
 WHERE Par.stream_id <> @ExcludedStreamId
   AND NOT EXISTS (

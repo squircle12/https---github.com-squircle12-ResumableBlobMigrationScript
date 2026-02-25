@@ -67,18 +67,25 @@ GO
 
 CREATE OR ALTER PROCEDURE dbo.usp_BlobDelta_Run
     @RunId        uniqueidentifier = NULL OUTPUT,
-    @RunType      nvarchar(20)     = N'Delta',  -- 'Full' or 'Delta'
-    @TableName    sysname          = NULL,      -- NULL = all active tables
+    @RunType      nvarchar(20)     = N'Delta',  -- 'Full','Delta','DryRun'
+    @TableName    sysname          = NULL,      -- NULL = all active tables (or filtered by @TargetDatabase)
     @BatchSize    int              = 500,
     @MaxDOP       tinyint          = 2,
     @Reset        bit              = 0,
-    @BusinessUnitId uniqueidentifier = NULL
+    @DryRun       bit              = 0,         -- If 1, print dynamic SQL instead of executing it
+    @BusinessUnitId uniqueidentifier = NULL,
+    @TargetDatabase sysname        = NULL      -- Optional: filter to tables where TargetDatabase matches
 AS
 BEGIN
     SET NOCOUNT ON;
 
     DECLARE @Now datetime2(7) = SYSDATETIME();
     DECLARE @RequestedBy sysname = SUSER_SNAME();
+
+    IF @DryRun = 1 AND @RunType <> N'DryRun'
+    BEGIN
+        SET @RunType = N'DryRun';
+    END
 
     IF @RunId IS NULL
     BEGIN
@@ -95,7 +102,34 @@ BEGIN
     INTO #TablesToProcess
     FROM dbo.BlobDeltaTableConfig c
     WHERE c.IsActive = 1
-      AND (@TableName IS NULL OR c.TableName = @TableName);
+      AND (@TableName IS NULL OR c.TableName = @TableName)
+      AND (@TargetDatabase IS NULL OR c.TargetDatabase = @TargetDatabase);
+
+    -- Diagnostic: report how many tables will be processed (helps when no rows are created)
+    DECLARE @TablesToProcessCount int = (SELECT COUNT(*) FROM #TablesToProcess);
+    IF @TablesToProcessCount = 0
+    BEGIN
+        PRINT N'No tables to process. Check that BlobDeltaTableConfig has a row where:';
+        PRINT N'  - TableName = @TableName (e.g. YnysMon_LA_FileTable.dbo.ReferralAttachment)';
+        PRINT N'  - TargetDatabase = @TargetDatabase when provided (e.g. YnysMon_LA_FileTable)';
+        PRINT N'  - IsActive = 1. Run 04_BlobDeltaJobs_Seed_Config.sql for new databases with the correct @FileTableDatabase.';
+        -- Still complete the run (update BlobDeltaRun status) but do nothing else
+    END
+    ELSE
+    BEGIN
+        PRINT N'Processing ' + CAST(@TablesToProcessCount AS nvarchar(10)) + N' table(s):';
+        DECLARE @TList sysname;
+        DECLARE list_cursor CURSOR FAST_FORWARD FOR SELECT TableName FROM #TablesToProcess ORDER BY TableName;
+        OPEN list_cursor;
+        FETCH NEXT FROM list_cursor INTO @TList;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            PRINT N'  - ' + @TList;
+            FETCH NEXT FROM list_cursor INTO @TList;
+        END
+        CLOSE list_cursor;
+        DEALLOCATE list_cursor;
+    END
 
     DECLARE @T_TableName sysname;
 
@@ -142,10 +176,72 @@ BEGIN
                 @MetadataModifiedOnColumn  = @MetadataModifiedOnColumn OUTPUT,
                 @SafetyBufferMinutes       = @SafetyBufferMinutes OUTPUT;
 
+            -- Validate that we got the required table names.
+            IF @TargetTableFull IS NULL
+            BEGIN
+                RAISERROR(N'Failed to resolve TargetTableFull for table ''%s''.', 16, 1, @T_TableName);
+            END
+
             -- Derive the Business Unit lookup table (e.g. <TargetDB>.<Schema>.LA_BU) from the target table.
-            SET @BusinessUnitTableFull =
-                PARSENAME(@TargetTableFull, 3) + N'.' +
-                PARSENAME(@TargetTableFull, 2) + N'.LA_BU';
+            DECLARE @ParsedTargetDatabase sysname = PARSENAME(@TargetTableFull, 3);
+            DECLARE @ParsedTargetSchema sysname = PARSENAME(@TargetTableFull, 2);
+            
+            IF @ParsedTargetDatabase IS NULL OR @ParsedTargetSchema IS NULL
+            BEGIN
+                RAISERROR(N'Failed to parse TargetTableFull ''%s'' for table ''%s''. Expected format: Database.Schema.Table', 16, 1, @TargetTableFull, @T_TableName);
+            END
+            
+            SET @BusinessUnitTableFull = @ParsedTargetDatabase + N'.' + @ParsedTargetSchema + N'.LA_BU';
+
+            -- Validate that the LA_BU table exists (helps catch configuration issues early)
+            DECLARE @ButTableExists bit = 0;
+            DECLARE @CheckButSql nvarchar(max) = N'
+            IF EXISTS (
+                SELECT 1 
+                FROM ' + QUOTENAME(@ParsedTargetDatabase) + N'.sys.tables t
+                INNER JOIN ' + QUOTENAME(@ParsedTargetDatabase) + N'.sys.schemas s ON t.schema_id = s.schema_id
+                WHERE t.name = N''LA_BU'' AND s.name = ' + QUOTENAME(@ParsedTargetSchema, '''') + N'
+            )
+                SELECT @Exists = 1
+            ELSE
+                SELECT @Exists = 0;';
+            
+            DECLARE @ButExistsParam nvarchar(max) = N'@Exists bit OUTPUT';
+            EXEC sp_executesql @CheckButSql, @ButExistsParam, @Exists = @ButTableExists OUTPUT;
+            
+            IF @ButTableExists = 0
+            BEGIN
+                DECLARE @ButErrorMsg nvarchar(max) = N'LA_BU table not found at ' + @BusinessUnitTableFull + 
+                    N' for table ''%s''. Please ensure the LA_BU table exists in the target database. ' +
+                    N'TargetDatabase: ' + @ParsedTargetDatabase + N', TargetSchema: ' + @ParsedTargetSchema;
+                RAISERROR(@ButErrorMsg, 16, 1, @T_TableName);
+            END
+            ELSE
+            BEGIN
+                -- Check if businessunit column exists
+                DECLARE @ButColumnExists bit = 0;
+                DECLARE @CheckButColumnSql nvarchar(max) = N'
+                IF EXISTS (
+                    SELECT 1 
+                    FROM ' + QUOTENAME(@ParsedTargetDatabase) + N'.sys.columns c
+                    INNER JOIN ' + QUOTENAME(@ParsedTargetDatabase) + N'.sys.tables t ON c.object_id = t.object_id
+                    INNER JOIN ' + QUOTENAME(@ParsedTargetDatabase) + N'.sys.schemas s ON t.schema_id = s.schema_id
+                    WHERE t.name = N''LA_BU'' AND s.name = ' + QUOTENAME(@ParsedTargetSchema, '''') + 
+                    N' AND c.name = N''businessunit''
+                )
+                    SELECT @Exists = 1
+                ELSE
+                    SELECT @Exists = 0;';
+                
+                EXEC sp_executesql @CheckButColumnSql, @ButExistsParam, @Exists = @ButColumnExists OUTPUT;
+                
+                IF @ButColumnExists = 0
+                BEGIN
+                    DECLARE @ButColumnErrorMsg nvarchar(max) = N'Column ''businessunit'' not found in table ' + @BusinessUnitTableFull + 
+                        N' for table ''%s''. Please verify the LA_BU table structure matches the expected schema.';
+                    RAISERROR(@ButColumnErrorMsg, 16, 1, @T_TableName);
+                END
+            END
 
             IF @SafetyBufferMinutes IS NULL SET @SafetyBufferMinutes = 240;
 
@@ -155,15 +251,25 @@ BEGIN
             WHERE h.TableName = @T_TableName;
 
             SET @WindowEnd = DATEADD(MINUTE, -@SafetyBufferMinutes, @RunStartForTable);
-            SET @WindowStart =
-                CASE
-                    WHEN @LastHighWater IS NULL
-                        THEN DATEADD(DAY, -365, @WindowEnd) -- conservative baseline; can be adjusted.
-                    ELSE DATEADD(MINUTE, -@SafetyBufferMinutes, @LastHighWater)
-                END;
+            -- For RunType 'Full', always use a full window (ignore stored high-watermark) so initial/full loads work.
+            IF @RunType = N'Full'
+            BEGIN
+                SET @WindowStart = DATEADD(YEAR, -25, @WindowEnd);
+                PRINT N'Table ' + @T_TableName + N': RunType=Full, window last 25 years; WindowStart=' + CONVERT(nvarchar(30), @WindowStart, 126) + N', WindowEnd=' + CONVERT(nvarchar(30), @WindowEnd, 126);
+            END
+            ELSE
+            BEGIN
+                SET @WindowStart =
+                    CASE
+                        WHEN @LastHighWater IS NULL
+                            THEN DATEADD(DAY, -365, @WindowEnd) -- conservative baseline; can be adjusted.
+                        ELSE DATEADD(MINUTE, -@SafetyBufferMinutes, @LastHighWater)
+                    END;
+                PRINT N'Table ' + @T_TableName + N': WindowStart=' + CONVERT(nvarchar(30), @WindowStart, 126) + N', WindowEnd=' + CONVERT(nvarchar(30), @WindowEnd, 126) + N', LastHighWater=' + ISNULL(CONVERT(nvarchar(30), @LastHighWater, 126), N'NULL');
+            END
 
             -- Optional reset support for this run/table.
-            IF @Reset = 1
+            IF @Reset = 1 AND @DryRun = 0
             BEGIN
                 DELETE FROM dbo.BlobDeltaMissingParentsQueue
                 WHERE RunId = @RunId AND TableName = @T_TableName;
@@ -172,13 +278,16 @@ BEGIN
                 WHERE RunId = @RunId AND TableName = @T_TableName;
             END
 
-            -- Acquire simple lease for this table.
-            UPDATE h
-            SET IsRunning = 1,
-                RunLeaseExpiresAt = DATEADD(MINUTE, 60, @RunStartForTable),
-                LastRunId = @RunId
-            FROM dbo.BlobDeltaHighWatermark h
-            WHERE h.TableName = @T_TableName;
+            -- Acquire simple lease for this table (skip in dry-run mode).
+            IF @DryRun = 0
+            BEGIN
+                UPDATE h
+                SET IsRunning = 1,
+                    RunLeaseExpiresAt = DATEADD(MINUTE, 60, @RunStartForTable),
+                    LastRunId = @RunId
+                FROM dbo.BlobDeltaHighWatermark h
+                WHERE h.TableName = @T_TableName;
+            END
 
             -- -----------------------------------------------------------------
             -- Step 1: Roots
@@ -205,14 +314,39 @@ BEGIN
                     FROM dbo.BlobDeltaStepScript
                     WHERE StepNumber = 1 AND ScriptKind = N'Roots';
 
+                    IF @Sql IS NULL
+                    BEGIN
+                        RAISERROR(N'Script template not found for StepNumber=1, ScriptKind=''Roots''.', 16, 1);
+                    END
+
+                    -- Validate required variables are set before replacement.
+                    IF @BusinessUnitTableFull IS NULL
+                    BEGIN
+                        RAISERROR(N'BusinessUnitTableFull is NULL for table ''%s''. TargetTableFull: ''%s''', 16, 1, @T_TableName, @TargetTableFull);
+                    END
+
                     -- Replace placeholders with table/column names, BU table, and MaxDOP.
-                    SET @Sql = REPLACE(@Sql, N'[SourceTableFull]',          @SourceTableFull);
-                    SET @Sql = REPLACE(@Sql, N'[TargetTableFull]',          @TargetTableFull);
-                    SET @Sql = REPLACE(@Sql, N'[MetadataTableFull]',        @MetadataTableFull);
-                    SET @Sql = REPLACE(@Sql, N'[MetadataIdColumn]',         @MetadataIdColumn);
-                    SET @Sql = REPLACE(@Sql, N'[MetadataModifiedOnColumn]', @MetadataModifiedOnColumn);
+                    SET @Sql = REPLACE(@Sql, N'[SourceTableFull]',          ISNULL(@SourceTableFull, N''));
+                    SET @Sql = REPLACE(@Sql, N'[TargetTableFull]',          ISNULL(@TargetTableFull, N''));
+                    SET @Sql = REPLACE(@Sql, N'[MetadataTableFull]',        ISNULL(@MetadataTableFull, N''));
+                    SET @Sql = REPLACE(@Sql, N'[MetadataIdColumn]',         ISNULL(@MetadataIdColumn, N''));
+                    SET @Sql = REPLACE(@Sql, N'[MetadataModifiedOnColumn]', ISNULL(@MetadataModifiedOnColumn, N''));
                     SET @Sql = REPLACE(@Sql, N'[BusinessUnitTableFull]',    @BusinessUnitTableFull);
                     SET @Sql = REPLACE(@Sql, N'[MaxDOP]',                   CAST(@MaxDOP AS nvarchar(10)));
+
+                    IF @DryRun = 1
+                    BEGIN
+                        PRINT N'==== DRY RUN (Step 1 - Roots) for table ' + @T_TableName + N', batch ' + CAST(@BatchNumber AS nvarchar(10)) + N' ====';
+                        PRINT @Sql;
+                        PRINT N'-- Parameters:'
+                            + N' @BatchSize=' + CAST(@BatchSize AS nvarchar(20))
+                            + N', @ExcludedStreamId=' + CAST(@ExcludedStreamId AS nvarchar(50))
+                            + N', @WindowStart=' + CAST(@WindowStart AS nvarchar(50))
+                            + N', @WindowEnd=' + CAST(@WindowEnd AS nvarchar(50))
+                            + N', @BusinessUnitId=' + ISNULL(CAST(@BusinessUnitId AS nvarchar(50)), N'NULL');
+                        -- In dry run we only print the generated SQL once for this step.
+                        BREAK;
+                    END
 
                     EXEC sp_executesql @Sql,
                         N'@BatchSize int,
@@ -243,7 +377,12 @@ BEGIN
                          @BatchStartedAt, @BatchCompletedAt,
                          N'InProgress', NULL);
 
-                    IF @Rows = 0 BREAK;
+                    IF @Rows = 0
+                    BEGIN
+                        IF @BatchNumber = 1
+                            PRINT N'Step 1 (Roots) for ' + @T_TableName + N': 0 rows in first batch. Check source/metadata data in window and LA_BU join.';
+                        BREAK;
+                    END
                 END;
 
                 INSERT INTO dbo.BlobDeltaRunStep
@@ -283,30 +422,60 @@ BEGIN
                     WHERE RunId = @RunId AND TableName = @T_TableName
                 )
                 BEGIN
+                    -- Validate BusinessUnitTableFull is set before queue population
+                    IF @BusinessUnitTableFull IS NULL
+                    BEGIN
+                        RAISERROR(N'BusinessUnitTableFull is NULL for table ''%s'' in Step 2. TargetTableFull: ''%s''', 16, 1, @T_TableName, @TargetTableFull);
+                    END
+                    
                     SELECT @Sql = ScriptBody
                     FROM dbo.BlobDeltaQueuePopulationScript
                     WHERE TableName = @T_TableName;
+                    
+                    IF @Sql IS NULL
+                    BEGIN
+                        RAISERROR(N'Queue population script not found for table ''%s''.', 16, 1, @T_TableName);
+                    END
 
-                    SET @Sql = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@Sql,
-                        N'[SourceTableFull]',          @SourceTableFull),
-                        N'[TargetTableFull]',          @TargetTableFull),
-                        N'[MetadataTableFull]',        @MetadataTableFull),
-                        N'[MetadataIdColumn]',         @MetadataIdColumn),
-                        N'[MetadataModifiedOnColumn]', @MetadataModifiedOnColumn);
+                    -- Replace placeholders, including BusinessUnitTableFull so we don't leave a literal
+                    -- [BusinessUnitTableFull] token in the dynamic SQL.
+                    SET @Sql = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@Sql,
+                        N'[SourceTableFull]',          ISNULL(@SourceTableFull, N'')),
+                        N'[TargetTableFull]',          ISNULL(@TargetTableFull, N'')),
+                        N'[MetadataTableFull]',        ISNULL(@MetadataTableFull, N'')),
+                        N'[MetadataIdColumn]',         ISNULL(@MetadataIdColumn, N'')),
+                        N'[MetadataModifiedOnColumn]', ISNULL(@MetadataModifiedOnColumn, N'')),
+                        N'[BusinessUnitTableFull]',    ISNULL(@BusinessUnitTableFull, N''));
 
-                    EXEC sp_executesql @Sql,
-                        N'@RunId uniqueidentifier,
-                          @TableName sysname,
-                          @ExcludedStreamId uniqueidentifier,
-                          @WindowStart datetime2(7),
-                          @WindowEnd datetime2(7),
-                          @BusinessUnitId uniqueidentifier',
-                        @RunId          = @RunId,
-                        @TableName      = @T_TableName,
-                        @ExcludedStreamId = @ExcludedStreamId,
-                        @WindowStart    = @WindowStart,
-                        @WindowEnd      = @WindowEnd,
-                        @BusinessUnitId = @BusinessUnitId;
+                    IF @DryRun = 1
+                    BEGIN
+                        PRINT N'==== DRY RUN (Step 2 - Queue population) for table ' + @T_TableName + N' ====';
+                        PRINT @Sql;
+                        PRINT N'-- Parameters:'
+                            + N' @RunId=' + CAST(@RunId AS nvarchar(50))
+                            + N', @TableName=' + @T_TableName
+                            + N', @ExcludedStreamId=' + CAST(@ExcludedStreamId AS nvarchar(50))
+                            + N', @WindowStart=' + CAST(@WindowStart AS nvarchar(50))
+                            + N', @WindowEnd=' + CAST(@WindowEnd AS nvarchar(50))
+                            + N', @BusinessUnitId=' + ISNULL(CAST(@BusinessUnitId AS nvarchar(50)), N'NULL');
+                    END
+                    ELSE
+                    BEGIN
+                        EXEC sp_executesql @Sql,
+                            N'@RunId uniqueidentifier,
+                              @TableName sysname,
+                              @ExcludedStreamId uniqueidentifier,
+                              @WindowStart datetime2(7),
+                              @WindowEnd datetime2(7),
+                              @BusinessUnitId uniqueidentifier',
+                            @RunId          = @RunId,
+                            @TableName      = @T_TableName,
+                            @ExcludedStreamId = @ExcludedStreamId,
+                            @WindowStart    = @WindowStart,
+                            @WindowEnd      = @WindowEnd,
+                            @BusinessUnitId = @BusinessUnitId;
+                    END
+                    
                 END
 
                 WHILE 1 = 1
@@ -339,6 +508,15 @@ BEGIN
                     SET @Sql = REPLACE(@Sql, N'[SourceTableFull]', @SourceTableFull);
                     SET @Sql = REPLACE(@Sql, N'[TargetTableFull]', @TargetTableFull);
                     SET @Sql = REPLACE(@Sql, N'[MaxDOP]',          CAST(@MaxDOP AS nvarchar(10)));
+
+                    IF @DryRun = 1
+                    BEGIN
+                        PRINT N'==== DRY RUN (Step 2 - MissingParentsBatch) for table ' + @T_TableName + N', batch ' + CAST(@BatchNumber AS nvarchar(10)) + N' ====';
+                        PRINT @Sql;
+                        PRINT N'-- Parameters: @BatchSize=' + CAST(@BatchSize AS nvarchar(20));
+                        -- In dry run we only print the generated SQL once for this step.
+                        BREAK;
+                    END
 
                     EXEC sp_executesql @Sql,
                         N'@BatchSize int',
@@ -410,14 +588,39 @@ BEGIN
                     FROM dbo.BlobDeltaStepScript
                     WHERE StepNumber = 3 AND ScriptKind = N'Children';
 
-                    SET @Sql = REPLACE(@Sql, N'[SourceTableFull]',          @SourceTableFull);
-                    SET @Sql = REPLACE(@Sql, N'[TargetTableFull]',          @TargetTableFull);
-                    SET @Sql = REPLACE(@Sql, N'[MetadataTableFull]',        @MetadataTableFull);
-                    SET @Sql = REPLACE(@Sql, N'[MetadataIdColumn]',         @MetadataIdColumn);
-                    SET @Sql = REPLACE(@Sql, N'[MetadataModifiedOnColumn]', @MetadataModifiedOnColumn);
+                    IF @Sql IS NULL
+                    BEGIN
+                        RAISERROR(N'Script template not found for StepNumber=3, ScriptKind=''Children''.', 16, 1);
+                    END
+
+                    -- Validate required variables are set before replacement.
+                    IF @BusinessUnitTableFull IS NULL
+                    BEGIN
+                        RAISERROR(N'BusinessUnitTableFull is NULL for table ''%s''. TargetTableFull: ''%s''', 16, 1, @T_TableName, @TargetTableFull);
+                    END
+
+                    SET @Sql = REPLACE(@Sql, N'[SourceTableFull]',          ISNULL(@SourceTableFull, N''));
+                    SET @Sql = REPLACE(@Sql, N'[TargetTableFull]',          ISNULL(@TargetTableFull, N''));
+                    SET @Sql = REPLACE(@Sql, N'[MetadataTableFull]',        ISNULL(@MetadataTableFull, N''));
+                    SET @Sql = REPLACE(@Sql, N'[MetadataIdColumn]',         ISNULL(@MetadataIdColumn, N''));
+                    SET @Sql = REPLACE(@Sql, N'[MetadataModifiedOnColumn]', ISNULL(@MetadataModifiedOnColumn, N''));
                     SET @Sql = REPLACE(@Sql, N'[BusinessUnitTableFull]',    @BusinessUnitTableFull);
 
                     -- Step 3 uses MAXDOP 1 in the template; no [MaxDOP] placeholder.
+
+                    IF @DryRun = 1
+                    BEGIN
+                        PRINT N'==== DRY RUN (Step 3 - Children) for table ' + @T_TableName + N', batch ' + CAST(@BatchNumber AS nvarchar(10)) + N' ====';
+                        PRINT @Sql;
+                        PRINT N'-- Parameters:'
+                            + N' @BatchSize=' + CAST(@BatchSize AS nvarchar(20))
+                            + N', @ExcludedStreamId=' + CAST(@ExcludedStreamId AS nvarchar(50))
+                            + N', @WindowStart=' + CAST(@WindowStart AS nvarchar(50))
+                            + N', @WindowEnd=' + CAST(@WindowEnd AS nvarchar(50))
+                            + N', @BusinessUnitId=' + ISNULL(CAST(@BusinessUnitId AS nvarchar(50)), N'NULL');
+                        -- In dry run we only print the generated SQL once for this step.
+                        BREAK;
+                    END
 
                     EXEC sp_executesql @Sql,
                         N'@BatchSize int,
@@ -467,15 +670,19 @@ BEGIN
 
             -- -----------------------------------------------------------------
             -- Success for this table: advance high-watermark and clear lease.
+            -- In dry-run mode, we do not persist high-watermarks or lease changes.
             -- -----------------------------------------------------------------
-            UPDATE dbo.BlobDeltaHighWatermark
-            SET LastHighWaterModifiedOn = @WindowEnd,
-                LastRunId                = @RunId,
-                LastRunCompletedAt       = SYSDATETIME(),
-                IsInitialFullLoadDone    = 1,
-                IsRunning                = 0,
-                RunLeaseExpiresAt        = NULL
-            WHERE TableName = @T_TableName;
+            IF @DryRun = 0
+            BEGIN
+                UPDATE dbo.BlobDeltaHighWatermark
+                SET LastHighWaterModifiedOn = @WindowEnd,
+                    LastRunId                = @RunId,
+                    LastRunCompletedAt       = SYSDATETIME(),
+                    IsInitialFullLoadDone    = 1,
+                    IsRunning                = 0,
+                    RunLeaseExpiresAt        = NULL
+                WHERE TableName = @T_TableName;
+            END
         END TRY
         BEGIN CATCH
             DECLARE @ErrMsg nvarchar(max) = ERROR_MESSAGE();
@@ -495,10 +702,13 @@ BEGIN
                  SYSDATETIME(),
                  N'Failed', @ErrMsg);
 
-            UPDATE dbo.BlobDeltaHighWatermark
-            SET IsRunning         = 0,
-                RunLeaseExpiresAt = NULL
-            WHERE TableName = @T_TableName;
+            IF @DryRun = 0
+            BEGIN
+                UPDATE dbo.BlobDeltaHighWatermark
+                SET IsRunning         = 0,
+                    RunLeaseExpiresAt = NULL
+                WHERE TableName = @T_TableName;
+            END
 
             UPDATE dbo.BlobDeltaRun
             SET Status       = N'Failed',
@@ -537,7 +747,9 @@ CREATE OR ALTER PROCEDURE dbo.usp_BlobDelta_RunOperator
     @TableName     sysname      = NULL,          -- used when @Mode = 'SingleTable'
     @BatchSize     int          = 500,
     @MaxDOP        tinyint      = 2,
-    @BusinessUnitId uniqueidentifier = NULL
+    @DryRun        bit          = 0,             -- If 1, print dynamic SQL instead of executing it
+    @BusinessUnitId uniqueidentifier = NULL,
+    @TargetDatabase sysname     = NULL           -- Optional: filter to tables where TargetDatabase matches (works with 'AllTables' mode)
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -553,7 +765,9 @@ BEGIN
             @BatchSize    = @BatchSize,
             @MaxDOP       = @MaxDOP,
             @Reset        = 0,
-            @BusinessUnitId = @BusinessUnitId;
+            @DryRun       = @DryRun,
+            @BusinessUnitId = @BusinessUnitId,
+            @TargetDatabase = @TargetDatabase;
     END
     ELSE IF @Mode = N'SingleTable'
     BEGIN
@@ -570,7 +784,9 @@ BEGIN
             @BatchSize    = @BatchSize,
             @MaxDOP       = @MaxDOP,
             @Reset        = 0,
-            @BusinessUnitId = @BusinessUnitId;
+            @DryRun       = @DryRun,
+            @BusinessUnitId = @BusinessUnitId,
+            @TargetDatabase = @TargetDatabase;
     END
     ELSE
     BEGIN
